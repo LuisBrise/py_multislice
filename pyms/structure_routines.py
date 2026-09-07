@@ -31,6 +31,20 @@ from .utils.torch_utils import (
 )
 from . import _float, _int, _uint
 import scipy.special as sc
+from typing import Optional
+from .magnetic_form_factors import has_magnetic_data, load_magnetic_form_factor
+
+# e/hbar, converted for use with lengths in Angstrom and A_z in Tesla*Angstrom
+# (so that magnetic phases come out directly in radians -- see
+# make_magnetic_potential). Ported verbatim from the validated Fortran
+# reference (potential.f90 / cms.f90: magfac = (echarge/rplanck)*1e-20),
+# using SI e = 1.602176634e-19 C and SI hbar = 1.054571817e-34 J.s; the
+# 1e-20 factor converts Angstrom**2 to metre**2 (1 Angstrom = 1e-10 m) so
+# that everything else in this module can stay in Angstrom, matching PyMS's
+# existing convention (feature-01-magnetic-phase-modulation.md Sec. 1.4).
+_ECHARGE_SI = 1.602176634e-19
+_HBAR_SI = 1.054571817e-34
+_MAGNETIC_PHASE_CONSTANT = (_ECHARGE_SI / _HBAR_SI) * 1e-20
 
 
 def remove_common_factors(nums):
@@ -264,7 +278,9 @@ class structure:
         Short description of the object of output purposes
     """
 
-    def __init__(self, unitcell, atoms, dwf, occ=None, Title="", EPS=1e-2):
+    def __init__(
+        self, unitcell, atoms, dwf, occ=None, Title="", EPS=1e-2, magnetic_moments=None
+    ):
         """
         Initialize a structure object with necessary variables.
 
@@ -286,6 +302,20 @@ class structure:
             A title for the simulation. Default is an empty string.
         EPS : float, optional
             A small value used for numerical tolerance in determining if the unit cell is orthorhombic. Default is 1e-2.
+        magnetic_moments : (natoms,3) array-like or None, optional
+            Cartesian (mx, my, mz) magnetic dipole moment per atom, in Bohr
+            magnetons. Default is None, meaning "no magnetic data": every
+            magnetic-potential-related method treats this exactly like a
+            structure with all-zero moments, so existing electrostatic-only
+            workflows that never pass this argument are completely
+            unaffected (Magnetic-PyMS's minimal-diff design constraint, see
+            claude/feature-01-magnetic-phase-modulation.md Sec. 3.1-3.2). Only
+            the in-plane (mx, my) components affect the magnetic phase (see
+            make_magnetic_potential); mz is accepted and stored (so callers
+            do not need to strip it) but does not contribute to any
+            multislice quantity computed here -- this is not an
+            approximation but an exact consequence of the projected-vector-
+            potential geometry, see feature-01 Sec. 1.2.
 
         Attributes:
         ----------
@@ -297,6 +327,8 @@ class structure:
             The title of the simulation.
         fractional_occupancy : bool
             Indicates if there is any fractional occupancy of atom sites in the sample.
+        magnetic_moments : numpy.ndarray or None
+            Per-atom (mx, my, mz) magnetic moments, see above.
 
         Notes:
         -----
@@ -345,6 +377,37 @@ class structure:
         # Check if there is any fractional occupancy of atom sites in
         # the sample
         self.fractional_occupancy = np.any(np.abs(self.atoms[:, 4] - 1.0) > 1e-3)
+
+        self.magnetic_moments = None
+        if magnetic_moments is not None:
+            self.set_magnetic_moments(magnetic_moments)
+
+    @property
+    def is_magnetic(self) -> bool:
+        """True if this structure has per-atom magnetic moment data attached."""
+        return self.magnetic_moments is not None
+
+    def set_magnetic_moments(self, magnetic_moments) -> None:
+        """
+        Attach (or replace) per-atom magnetic moments.
+
+        Parameters
+        ----------
+        magnetic_moments : (natoms,3) array_like
+            Cartesian (mx, my, mz) magnetic dipole moment per atom, in Bohr
+            magnetons -- see the ``structure.__init__`` docstring for the
+            data-model rationale (a plain (natoms,3) array rather than the
+            Fortran reference's magnitude + unit-direction pair, which is a
+            redundant, degenerate representation for zero-moment atoms).
+        """
+        magnetic_moments = np.asarray(magnetic_moments, dtype=_float)
+        natoms = self.atoms.shape[0]
+        if magnetic_moments.shape != (natoms, 3):
+            raise ValueError(
+                "magnetic_moments must have shape (natoms, 3) = "
+                f"({natoms}, 3), got {magnetic_moments.shape}"
+            )
+        self.magnetic_moments = magnetic_moments
 
     @classmethod
     def from_materials_project_api(cls, MPid, MPIkey):
@@ -1030,6 +1093,319 @@ class structure:
         return torch.fft.irfft2(P, s=pixels_)
         # return np.fft.irfft2(P.cpu().numpy(),s=pixels_)
 
+    def make_magnetic_potential(
+        self,
+        pixels,
+        subslices=[1.0],
+        tiling=[1, 1],
+        displacements=True,
+        fractional_occupancy=True,
+        sinc_deconvolution=True,
+        bandwidthlimit=0.2,
+        device=None,
+        dtype=torch.float32,
+        seed=None,
+    ):
+        """
+        Generate the magnetic phase contribution of the structure.
+
+        The magnetic analogue of ``make_potential``: calculates the phase
+        shift ``-(e/hbar) * A_z,p(x,y)`` imparted by the specimen's atomic
+        in-plane magnetic moments (see ``structure.magnetic_moments``) via
+        the projected z-component of the magnetic vector potential. The
+        return value is in the same units (radians) and on the same pixel
+        grid as ``interaction_constant(eV) * self.make_potential(...)``, so
+        it can simply be added to that quantity before exponentiating --
+        see ``make_transmission_functions(..., include_magnetic=True)``,
+        which does exactly this.
+
+        Physical formulation, numerical algorithm and software design are
+        documented in claude/feature-01-magnetic-phase-modulation.md
+        (Sec. 1, 2, 3 respectively) and claude/architecture-analysis.md
+        Sec. A.5-A.6. This function's sign and overall scale are validated
+        in tests/test_make_magnetic_potential.py by two independent,
+        periodicity-free methods: comparing the k-space array directly
+        (before the final inverse FFT) against the exact closed-form
+        structure factor of a single continuum atom at concrete DFT
+        frequencies (TestKSpaceStructureFactor), and checking that rotating
+        the whole configuration (position and moment) by 90/180 degrees
+        rotates the output by the same amount, exactly to float64 precision
+        (TestRotationalEquivariance). A direct real-space comparison
+        against the closed-form point-dipole result is also included
+        (TestRealSpaceDipolePair) but deliberately uses a loose tolerance
+        and a zero-net-moment pair of atoms rather than a single atom: a
+        single atom's nonzero net in-plane moment, once tiled periodically
+        by the FFT, is an infinite lattice of *parallel* dipole images
+        whose combined field does not converge (and was empirically found
+        to grow *less* accurate, not more, as the cell was enlarged at
+        fixed sample radius) to the isolated-atom result, because the
+        projected 2D magnetic vector potential's Green's function is only
+        marginally convergent -- a real, physically-expected limitation of
+        this periodic formulation (see Sec. 1.6, "periodic-vs-macroscopic
+        A_np gap"), not a defect in this function.
+
+        In brief: each atom's in-plane moment (mx, my) is deposited onto a
+        pixel grid exactly as ``make_potential`` deposits atomic density
+        (same bilinear/area-weighted scheme, reusing ``find_equivalent_
+        sites`` and the same displacement/fractional-occupancy handling),
+        separately per chemical element (each element has its own atomic
+        magnetic form factor, see ``magnetic_form_factors.py``). The two
+        deposited channels are Fourier transformed, deconvolved by the same
+        sinc kernel that corrects for the bilinear deposition's own
+        smoothing, multiplied by that element's atomic magnetic form factor
+        a(k) and the in-plane curl operator (i * (kx, -ky)), summed over
+        elements, and inverse Fourier transformed once. Unlike
+        ``make_potential`` (which uses a real-input ``rfft2``/``irfft2``
+        pair since the deposited density is real and non-negative), this
+        uses a complex ``fft2``/``ifft2`` pair throughout: the curl
+        operator introduces a genuine factor of i, so the intermediate
+        k-space arrays are not Hermitian-symmetric the way a real-valued
+        signal's would be. This costs a second full-size inverse FFT
+        relative to fusing the electrostatic and magnetic k-space arrays
+        into one, but is mathematically identical by linearity of the FFT
+        (IFFT(A) + IFFT(B) == IFFT(A + B) exactly) and keeps this function
+        fully independent of ``make_potential``'s internals, matching the
+        minimal-diff design constraint
+        (feature-01-magnetic-phase-modulation.md Sec. 3.1).
+
+        Elements with no tabulated magnetic form factor
+        (``magnetic_form_factors.has_magnetic_data``) or with a net in-plane
+        moment of exactly zero across the whole structure contribute
+        nothing and are skipped entirely, including the case where
+        ``self.magnetic_moments`` is None (no magnetic data at all): the
+        return value is then an exact all-zeros array of the correct shape,
+        so callers do not need to special-case a non-magnetic structure.
+
+        Parameters
+        ----------
+        pixels: int, (2,) array_like
+            The pixel size of the grid on which to calculate the projected
+            magnetic phase.
+        subslices: float, array_like, optional
+            As in ``make_potential``.
+        tiling: int, (2,) array_like, optional
+            As in ``make_potential``.
+        displacements: bool, optional
+            As in ``make_potential`` -- note that when both the electrostatic
+            and magnetic potentials are generated for the same slice (as
+            ``make_transmission_functions`` does), the same ``seed`` should
+            be used for both so that thermal displacements are consistent
+            between the two (this is the caller's responsibility; see
+            ``make_transmission_functions``).
+        fractional_occupancy: bool, optional
+            As in ``make_potential``.
+        sinc_deconvolution: bool, optional
+            As in ``make_potential``.
+        bandwidthlimit: float or None, optional
+            As in ``make_potential``.
+        device: torch.device, optional
+            As in ``make_potential``.
+        dtype: torch.dtype, optional
+            As in ``make_potential``. Note the returned array is real (a
+            phase in radians) even though complex intermediates are used
+            internally.
+        seed: int, optional
+            As in ``make_potential``.
+        """
+        realdtype = complex_to_real_dtype_torch(dtype)
+        complexdtype = torch.complex128 if realdtype == torch.float64 else torch.complex64
+
+        sblce = ensure_array(subslices)
+        device = get_device(device)
+        pixels_ = [int(x) for x in pixels]
+        if seed is not None:
+            torch.manual_seed(seed)
+
+        nsubslices = len(sblce)
+
+        if not self.is_magnetic:
+            return torch.zeros(nsubslices, *pixels_, device=device, dtype=realdtype)
+
+        tiling_ = np.asarray(tiling[:2])
+        gsize = np.asarray(self.unitcell[:2]) * tiling_
+        psize = np.asarray(pixels_)
+        pixperA = np.asarray(pixels_) / np.asarray(self.unitcell[:2]) / tiling_
+
+        Zs = np.asarray(self.atoms[:, 3], dtype=_int)
+        in_plane_moment = np.linalg.norm(self.magnetic_moments[:, :2], axis=1)
+        has_data = np.array([has_magnetic_data(int(Z)) for Z in Zs])
+        magnetic_mask = (in_plane_moment > 0) & has_data
+
+        if not np.any(magnetic_mask):
+            return torch.zeros(nsubslices, *pixels_, device=device, dtype=realdtype)
+
+        elements = sorted(set(Zs[magnetic_mask].tolist()))
+        nelements = len(elements)
+
+        if fractional_occupancy and self.fractional_occupancy:
+            equivalent_sites = find_equivalent_sites(self.atoms[:, :3], EPS=1e-3)
+
+        # Two channels (mx, my) per element per subslice, exactly mirroring
+        # make_potential's one channel (density) per element per subslice.
+        Pm = torch.zeros(
+            np.prod([nelements, 2, nsubslices, *pixels_]), device=device, dtype=realdtype
+        )
+
+        islice = np.zeros((self.atoms.shape[0],), dtype=_int)
+        slice_stride = np.prod(pixels_)
+        for i in range(nsubslices):
+            zmin = 0 if i == 0 else sblce[i - 1]
+            atoms_in_slice = (self.atoms[:, 2] % 1.0 >= zmin) & (
+                self.atoms[:, 2] % 1.0 < sblce[i]
+            )
+            islice[atoms_in_slice] = i * slice_stride
+        islice = torch.from_numpy(islice).type(torch.long).to(device)
+
+        channel_stride = nsubslices * slice_stride
+        element_stride = 2 * channel_stride
+        ielement_np = np.zeros(self.atoms.shape[0], dtype=_int)
+        for iatom in np.nonzero(magnetic_mask)[0]:
+            ielement_np[iatom] = element_stride * elements.index(int(Zs[iatom]))
+        ielement = torch.from_numpy(ielement_np).type(torch.long).to(device)
+
+        # Explicit mask (rather than relying on ielement bucketing alone) so
+        # that a non-magnetic atom contributes exactly zero regardless of
+        # which element slot it would otherwise hash into.
+        mask_t = torch.from_numpy(magnetic_mask.astype(np.float64)).type(realdtype).to(device)
+        mx_t = torch.from_numpy(self.magnetic_moments[:, 0]).type(realdtype).to(device) * mask_t
+        my_t = torch.from_numpy(self.magnetic_moments[:, 1]).type(realdtype).to(device) * mask_t
+
+        for tile in range(tiling[0] * tiling[1]):
+            posn = (
+                (
+                    self.atoms[:, :2]
+                    + np.asarray([tile % tiling[0], tile // tiling[0]])[np.newaxis, :]
+                )
+                / tiling_
+                * psize
+            )
+            posn = torch.from_numpy(posn).to(device).type(realdtype)
+
+            if displacements:
+                urms = torch.tensor(
+                    np.sqrt(self.atoms[:, 5])[:, np.newaxis] * pixperA[np.newaxis, :],
+                    dtype=realdtype,
+                    device=device,
+                ).view(self.atoms.shape[0], 2)
+                disp = (
+                    torch.randn(self.atoms.shape[0], 2, dtype=realdtype, device=device)
+                    * urms
+                )
+                if fractional_occupancy and self.fractional_occupancy:
+                    disp = disp[equivalent_sites, :]
+                posn = posn + disp
+
+            yc = (
+                torch.remainder(torch.ceil(posn[:, 0]).type(torch.long), pixels_[0])
+                * pixels_[1]
+            )
+            yf = (
+                torch.remainder(torch.floor(posn[:, 0]).type(torch.long), pixels_[0])
+                * pixels_[1]
+            )
+            xc = torch.remainder(torch.ceil(posn[:, 1]).type(torch.long), pixels_[1])
+            xf = torch.remainder(torch.floor(posn[:, 1]).type(torch.long), pixels_[1])
+
+            yh = torch.remainder(posn[:, 0], 1.0)
+            yl = 1.0 - yh
+            xh = torch.remainder(posn[:, 1], 1.0)
+            xl = 1.0 - xh
+
+            occ_w = torch.ones(self.atoms.shape[0], dtype=realdtype, device=device)
+            if fractional_occupancy and self.fractional_occupancy:
+                occ_w = torch.from_numpy(self.atoms[:, 4]).type(realdtype).to(device)
+
+            for chan_offset, wchan in (
+                (0, mx_t * occ_w),
+                (channel_stride, my_t * occ_w),
+            ):
+                idx = ielement + chan_offset + islice
+                Pm.scatter_add_(0, idx + yc + xc, yh * xh * wchan)
+                Pm.scatter_add_(0, idx + yc + xf, yh * xl * wchan)
+                Pm.scatter_add_(0, idx + yf + xc, yl * xh * wchan)
+                Pm.scatter_add_(0, idx + yf + xf, yl * xl * wchan)
+
+        Pm = Pm.view(nelements, 2, nsubslices, *pixels_).type(complexdtype)
+        Pm = torch.fft.fft2(Pm, s=pixels_)
+
+        if sinc_deconvolution:
+            sincy = (
+                sinc(torch.fft.fftfreq(pixels_[0]))
+                .view([1, 1, 1, pixels_[0], 1])
+                .to(device)
+                .type(complexdtype)
+            )
+            sincx = (
+                sinc(torch.fft.fftfreq(pixels_[1]))
+                .view([1, 1, 1, 1, pixels_[1]])
+                .to(device)
+                .type(complexdtype)
+            )
+            Pm = Pm / sincy
+            Pm = Pm / sincx
+
+        # Ordinary (not angular) reciprocal-space grid, matching the
+        # convention calculate_scattering_factors already uses for the
+        # electrostatic form factor -- see magnetic_form_factors.py's module
+        # docstring for why AtomicMagneticFormFactor.__call__ is written to
+        # take exactly this convention.
+        g = q_space_array(pixels_, gsize)
+        ky_np, kx_np = g[0], g[1]
+        kmag_np = np.sqrt(kx_np**2 + ky_np**2)
+
+        fmag_np = np.zeros((nelements, *pixels_), dtype=np.float64)
+        for ie, Z in enumerate(elements):
+            aff = load_magnetic_form_factor(int(Z))
+            fmag_np[ie] = aff(kmag_np)
+
+        # a(k)/k, with the (only) k=0 grid point set to exactly zero: a
+        # deliberate gauge choice (the mean projected A_z of a periodic cell
+        # is an unobservable constant phase offset, fixed to zero by
+        # convention) and a necessary singularity guard, since a(k) itself
+        # already diverges as k -> 0 -- see feature-01 Sec. 2.6 and
+        # magnetic_form_factors.AtomicMagneticFormFactor.
+        with np.errstate(divide="ignore", invalid="ignore"):
+            a_over_k_np = np.where(kmag_np > 0, fmag_np / np.where(kmag_np > 0, kmag_np, 1.0), 0.0)
+        a_over_k = torch.from_numpy(a_over_k_np).to(device).type(complexdtype)
+        kx = torch.from_numpy(kx_np).to(device).type(complexdtype)
+        ky = torch.from_numpy(ky_np).to(device).type(complexdtype)
+
+        i_unit = torch.tensor(1j, device=device, dtype=complexdtype)
+        # z-component of the curl of the (mx, my) areal magnetization,
+        # i * (kx * F[my] - ky * F[mx]) * a(k)/k -- see the module-level
+        # derivation in magnetic_form_factors.py and the sign/normalization
+        # validation in test_make_magnetic_potential.py.
+        #
+        # NB a_over_k is per-element (shape (nelements, *pixels_), since each
+        # element has its own atomic magnetic form factor a(k)) while kx/ky
+        # are shared across elements (shape (*pixels_,)); only the latter
+        # need two new leading axes ([None, None]) to broadcast against
+        # Pm's (nelements, nsubslices, *pixels_) -- a_over_k needs exactly
+        # one ([:, None], for the subslices axis). Using [None, None] on
+        # a_over_k too (an earlier version of this code did) silently
+        # inserts an extra length-1 axis instead of raising, because
+        # broadcasting happily aligns it from the right -- caught by
+        # test_make_magnetic_potential.py's point-dipole check asserting on
+        # the returned array's shape as well as its values.
+        Az_k = i_unit * a_over_k[:, None] * (
+            kx[None, None] * Pm[:, 1] - ky[None, None] * Pm[:, 0]
+        )
+        Az_k = torch.sum(Az_k, dim=0)  # sum over elements -> (nsubslices, *pixels_)
+
+        # Same discrete-deposition-to-continuum normalization make_potential
+        # applies to the electrostatic channel; a property of the shared
+        # bilinear-deposition-then-FFT pipeline, not of the specific form
+        # factor multiplied in afterwards (feature-01 Sec. 2.2-2.3).
+        norm = np.prod(pixels_) / np.prod(self.unitcell[:2]) / np.prod(tiling)
+        Az_k = norm * Az_k
+
+        if bandwidthlimit is not None:
+            Az_k = bandwidth_limit_array_torch(Az_k, limit=1, soft=bandwidthlimit, rfft=False)
+
+        Az_r = torch.real(torch.fft.ifft2(Az_k, s=pixels_))
+
+        return -_MAGNETIC_PHASE_CONSTANT * Az_r
+
     def make_potential_absorptive(
         self,
         pixels,
@@ -1578,6 +1954,7 @@ class structure:
         fractional_occupancy=True,
         seed=None,
         bandwidth_limit=2 / 3,
+        include_magnetic=True,
     ):
         """
         Make the transmission functions for the simulation object.
@@ -1603,7 +1980,32 @@ class structure:
             An array containing the electron scattering factors for the elements
             in the simulation object as calculated by the function
             calculate_scattering_factors
+        include_magnetic : bool, optional
+            If True (the default) and this structure has magnetic moment
+            data attached (``self.is_magnetic``), the magnetic phase from
+            ``make_magnetic_potential`` is added to the electrostatic phase
+            before exponentiating. For a structure with no magnetic data
+            this flag has no effect at all -- the electrostatic-only code
+            path below runs completely unchanged, so existing,
+            magnetic-agnostic callers are unaffected regardless of this
+            default (Magnetic-PyMS's backward-compatible design constraint,
+            see claude/feature-01-magnetic-phase-modulation.md Sec. 3.1-3.4).
+            Pass False to suppress the magnetic contribution for a
+            magnetic structure (e.g. to isolate the electrostatic-only
+            transmission function for comparison).
         """
+        # If thermal displacements are on and the caller did not pin down a
+        # seed, draw one now (once) so that the electrostatic potential
+        # below and the magnetic potential further down are generated from
+        # the *same* instantaneous displaced-atom configuration rather than
+        # two independently-randomized ones -- see make_magnetic_potential's
+        # own docstring note on this. This branch is only reached when there
+        # is a magnetic contribution to keep in sync, so it leaves the
+        # random-number stream (and hence output) of every existing,
+        # non-magnetic call completely unchanged.
+        if displacements and seed is None and include_magnetic and self.is_magnetic:
+            seed = int(torch.randint(0, 2**31 - 1, (1,)).item())
+
         # Make the specimen electrostatic potential
         T = self.make_potential(
             pixels,
@@ -1616,9 +2018,30 @@ class structure:
             fractional_occupancy=fractional_occupancy,
             seed=seed,
         )
-        # Now take the complex exponential of the electrostatic potential
-        # scaled by the electron interaction constant
-        T = torch.fft.fftn(torch.exp(1j * interaction_constant(eV) * T), dim=[-2, -1])
+        # Scale the electrostatic potential by the electron interaction
+        # constant to get the electrostatic phase contribution
+        phase = interaction_constant(eV) * T
+
+        # Add the magnetic phase contribution, if requested and present.
+        # Unlike the electrostatic term, this is NOT scaled by
+        # interaction_constant(eV): the Aharonov-Bohm phase produced by a
+        # vector potential does not depend on the electron-optical
+        # interaction constant (make_magnetic_potential already returns a
+        # phase in radians, see its docstring), so it is added directly.
+        if include_magnetic and self.is_magnetic:
+            phase = phase + self.make_magnetic_potential(
+                pixels,
+                subslices,
+                tiling,
+                displacements=displacements,
+                fractional_occupancy=fractional_occupancy,
+                device=device,
+                dtype=dtype,
+                seed=seed,
+            )
+
+        # Now take the complex exponential of the phase
+        T = torch.fft.fftn(torch.exp(1j * phase), dim=[-2, -1])
 
         # Band-width limit the transmission function, see Earl Kirkland's book
         # for an discussion of why this is necessary

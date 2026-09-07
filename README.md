@@ -10,6 +10,11 @@ GPU accelerated using
 
 Ionization based off [Flexible Atomic Code (FAC)](https://github.com/flexible-atomic-code/fac).
 
+**This branch (`magnetic-phase-modulation`)** extends `py_multislice` with magnetic
+phase modulation: an Aharonov-Bohm phase shift from a specimen's in-plane atomic
+magnetic moments, added on top of the usual electrostatic transmission function.
+See [Magnetic scattering](#magnetic-scattering) below.
+
 # Installation
 
 1. Clone or branch this repo into a directory on your computer
@@ -47,6 +52,46 @@ Ionization based off [Flexible Atomic Code (FAC)](https://github.com/flexible-at
 # Documentation and demos
 
 Documentation can be found [here](https://hamishgbrown.github.io/py_multislice/pyms/), for demonstrations and walk throughs on common simulation types see the Jupyter Notebooks in the [Demos](Demos/) folder. The Notebook for STEM-EELS is still under construction.
+
+# Magnetic scattering
+
+This branch adds magnetic phase modulation to `pyms.structure_routines.structure`:
+an Aharonov-Bohm phase shift, `exp[-i (e/hbar) integral(A_z dz)]`, imprinted by
+the in-plane component of a specimen's atomic magnetic moments, computed
+alongside (and added into) the ordinary electrostatic transmission function.
+Only the in-plane moment components contribute to this phase -- a moment
+purely along the beam direction contributes exactly zero, a standard result
+for collinear magnetism (see Edstrom, Lubk & Rusz, *Magnetic effects in the
+paraxial regime of elastic electron scattering*, Phys. Rev. B 94, 174414
+(2016)). This is one specific channel of the full magnetic Pauli-equation
+Hamiltonian; see the docstrings in `pyms/structure_routines.py` for the full
+scope, references, and design notes.
+
+**What's new:**
+
+- `structure(unitcell, atoms, dwf, magnetic_moments=...)` -- an optional,
+  default-`None` `(natoms, 3)` array of Cartesian (mx, my, mz) moments per
+  atom, in Bohr magnetons.
+- `structure.make_magnetic_potential(...)` -- the magnetic phase on its own,
+  mirroring the existing `make_potential`'s call signature.
+- `structure.make_transmission_functions(..., include_magnetic=True)` -- adds
+  the magnetic phase into the combined transmission function (the default).
+  A structure with no magnetic moment data (the default, `magnetic_moments=
+  None`) is completely unaffected by this flag -- every pre-existing,
+  non-magnetic call site keeps working exactly as before.
+
+**Examples:**
+
+- [`Demos/Magnetic_Phase_Modulation.ipynb`](Demos/Magnetic_Phase_Modulation.ipynb) --
+  a worked walkthrough: building a magnetic structure, the magnetic phase
+  alongside the electrostatic potential, the combined transmission function,
+  and the (small but real) effect on a propagated exit wave and diffraction
+  pattern.
+- `tests/test_magnetic_form_factors.py`, `tests/test_make_magnetic_potential.py`,
+  `tests/test_make_transmission_functions_magnetic.py` -- 35 focused unit
+  tests that double as runnable usage examples, including zero-net-moment
+  structures, rotational equivariance checks, and backward-compatibility
+  checks against non-magnetic structures.
 
 # Bug-fixes and contributions
 
