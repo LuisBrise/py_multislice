@@ -9,9 +9,6 @@ following the "quasi-dipole" parametrization of
     and fields for efficient multislice calculations of electron scattering
     in magnetic materials," Ultramicroscopy 231, 113315 (2021).
 
-See claude/feature-01-magnetic-phase-modulation.md Sec. 1.3 and 2.4, and
-claude/architecture-analysis.md Sec. A.5, in the project's design docs for
-the full physical and numerical derivation this module implements.
 
 Physical background
 --------------------
@@ -120,7 +117,6 @@ except ImportError as _e:  # pragma: no cover - import-time environment check
 # Lyon & Rusz (2021) Table 1 quasi-dipole fit coefficients, transcribed
 # verbatim from the validated Fortran reference's ak_mod.f90::init_mparams
 # (independently spot-checked against the published table for Sc during
-# design review; see claude/architecture-analysis.md Sec. A.5).
 #
 # Keys are atomic number Z. Values are
 # (a0, b0, a1, b1, a2, b2, a3, b3, a4, b4).
@@ -169,8 +165,7 @@ def has_magnetic_data(Z: int) -> bool:
     independent (and not necessarily consistent) gates: ``atoms.f90``'s
     hardcoded ``is_magnetic(Z)`` transition-metal range check, used only by
     its dead real-space code path, and ``ak_mod.f90``'s data-file-existence
-    check, used by the active path. See
-    claude/known-issues-and-open-questions.md, Finding 3.
+    check, used by the active path. 
 
     Parameters
     ----------

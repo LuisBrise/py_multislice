@@ -308,8 +308,7 @@ class structure:
             magnetic-potential-related method treats this exactly like a
             structure with all-zero moments, so existing electrostatic-only
             workflows that never pass this argument are completely
-            unaffected (Magnetic-PyMS's minimal-diff design constraint, see
-            claude/feature-01-magnetic-phase-modulation.md Sec. 3.1-3.2). Only
+            unaffected (Magnetic-PyMS's minimal-diff design constraint. Only
             the in-plane (mx, my) components affect the magnetic phase (see
             make_magnetic_potential); mz is accepted and stored (so callers
             do not need to strip it) but does not contribute to any
@@ -1119,10 +1118,7 @@ class structure:
         see ``make_transmission_functions(..., include_magnetic=True)``,
         which does exactly this.
 
-        Physical formulation, numerical algorithm and software design are
-        documented in claude/feature-01-magnetic-phase-modulation.md
-        (Sec. 1, 2, 3 respectively) and claude/architecture-analysis.md
-        Sec. A.5-A.6. This function's sign and overall scale are validated
+        This function's sign and overall scale are validated
         in tests/test_make_magnetic_potential.py by two independent,
         periodicity-free methods: comparing the k-space array directly
         (before the final inverse FFT) against the exact closed-form
@@ -1988,8 +1984,7 @@ class structure:
             this flag has no effect at all -- the electrostatic-only code
             path below runs completely unchanged, so existing,
             magnetic-agnostic callers are unaffected regardless of this
-            default (Magnetic-PyMS's backward-compatible design constraint,
-            see claude/feature-01-magnetic-phase-modulation.md Sec. 3.1-3.4).
+            default (Magnetic-PyMS's backward-compatible design constraint.
             Pass False to suppress the magnetic contribution for a
             magnetic structure (e.g. to isolate the electrostatic-only
             transmission function for comparison).
